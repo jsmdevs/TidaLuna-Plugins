@@ -41,10 +41,19 @@ so the next translation is built with the new settings.
 
 ## How it works
 
-Lyrics arrive through the `content/LOAD_ITEM_LYRICS_SUCCESS` redux action, which the plugin
-intercepts. Translated lyrics are pushed back through the same action (preceded by a `_FAIL`
-so the view actually re-renders); a guard flag keeps those self-dispatches from being
-re-intercepted.
+**Where lyrics live.** Current TIDAL builds no longer use the `content/LOAD_ITEM_LYRICS_*`
+redux actions — no action creators are registered for them and there is no lyrics slice in
+`content`. Lyrics now ride along with the RTK Query `getTracksById` request as an included
+`lyrics` resource (`attributes.text` for the plain view, `attributes.lrcText` for the synced
+one). That is why plugins written against the old actions do nothing on these builds.
+
+So this plugin watches the redux store for that cache entry, and writes translations back
+with RTK Query's own `queryResultPatched` action. Patching the cache rather than the DOM
+means whatever renders the lyrics picks the translation up — including other lyrics plugins
+such as Radiant Lyrics.
+
+The lyrics resource's position inside `included` is resolved at patch time, not cached: the
+array is rebuilt on every refetch and the resource does not keep a fixed index.
 
 Translation goes through Google's public `translate_a/single` (gtx) endpoint — no API key.
 Two details that matter:
@@ -69,6 +78,10 @@ track and per settings combination.
   that still fails keeps its original text rather than blanking out.
 - Machine translation of lyrics is machine translation — idioms and wordplay will suffer.
   This is why `Original + translation` is the default.
-- The toolbar button attaches next to the lyrics view's fullscreen toggle. If TIDAL reworks
-  that toolbar, the button may disappear until the selector is updated; auto-translate keeps
-  working regardless.
+- The toolbar button attaches next to the lyrics tab in the now-playing view
+  (`[data-test="toggle-lyrics"]`, falling back to the icon action bar and then to the
+  pre-2025 toolbar). If TIDAL reworks that area the button may disappear until the selector
+  is updated; auto-translate keeps working regardless.
+- Reloading the plugin while a patched track is still playing makes it treat the translated
+  text as the original, since the patched cache outlives the plugin. It sorts itself out on
+  the next track — it only shows up in a dev loop, not in normal use.
