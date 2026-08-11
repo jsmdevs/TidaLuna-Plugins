@@ -55,6 +55,20 @@ such as Radiant Lyrics.
 The lyrics resource's position inside `included` is resolved at patch time, not cached: the
 array is rebuilt on every refetch and the resource does not keep a fixed index.
 
+**When another plugin owns the lyrics.** Plugins like
+[Radiant Lyrics](https://github.com/meowarex/TidaLuna-Plugins) fetch lyrics from their own
+provider and inject them into the view as a synthetic entity (`radiant-lyrics-<trackId>` in
+`state.entities.lyrics`), so nothing written to TIDAL's cache is ever read — the track may
+not even have a TIDAL lyrics entry at all.
+
+For that case the plugin falls back to a display overlay: it reads the lyrics that are
+actually in play, translates them, and rewrites the rendered lines, reapplying on every
+redraw. The original nodes are moved aside rather than destroyed, so word-level highlighting
+survives.
+
+Which path is used is decided per translation, not configured: the data is patched first,
+and if a translated line doesn't turn up on screen shortly after, the overlay takes over.
+
 Translation goes through Google's public `translate_a/single` (gtx) endpoint — no API key.
 Two details that matter:
 

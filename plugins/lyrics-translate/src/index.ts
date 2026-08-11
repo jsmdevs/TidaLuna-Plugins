@@ -1,11 +1,12 @@
 import { reduxStore, Tracer, type LunaUnload } from "@luna/core";
 import { observe } from "@luna/lib";
 
+import { domShowsLine, initOverlay, normalizeLine, setOverlay } from "./domOverlay";
 import { isRightToLeft, sameLanguage } from "./languages";
-import { collectSourceLines, renderLyrics, type LyricsText } from "./lyrics";
+import { collectSourceLines, renderLyrics, renderParts, type LyricsText } from "./lyrics";
 import { partsFor, type LinePart } from "./modes";
 import { settings, Settings } from "./Settings";
-import { findLyrics, patchLyrics, playingTrackId, type LyricsSnapshot } from "./tidalLyrics";
+import { findAnyLyrics, patchLyrics, playingTrackId, type LyricsSnapshot } from "./tidalLyrics";
 import { romanizeLines, translateLines } from "./translator";
 
 export const { trace, errSignal } = Tracer("[LyricsTranslate]");
@@ -17,9 +18,16 @@ const LTR = "LEFT_TO_RIGHT";
 
 // Lyrics as they arrived from TIDAL, before anything was written back.
 const originals = new Map<string, LyricsSnapshot>();
-// Rendered results, keyed by cache entry + the settings that shaped them.
+interface Render {
+	/** Whole-document form, for rewriting TIDAL's own cache. */
+	lyrics: LyricsText;
+	/** Per-line form, for the display overlay: normalized source line -> its parts. */
+	lines: Map<string, string[]>;
+}
+
+// Rendered results, keyed by lyrics source + the settings that shaped them.
 const CACHE_LIMIT = 50;
-const renders = new Map<string, LyricsText>();
+const renders = new Map<string, Render>();
 
 const settingsKey = () =>
 	[settings.targetLanguage, settings.displayMode, settings.layout, settings.inlineSeparator, settings.skipSameLanguage].join("|");
@@ -36,7 +44,7 @@ export const clearCache = () => {
 	updateButtons();
 };
 
-const buildTranslation = async (source: LyricsSnapshot): Promise<LyricsText | null> => {
+const buildTranslation = async (source: LyricsSnapshot): Promise<Render | null> => {
 	const sources = collectSourceLines(source);
 	if (sources.length === 0) return null;
 
@@ -74,7 +82,11 @@ const buildTranslation = async (source: LyricsSnapshot): Promise<LyricsText | nu
 		return line;
 	};
 
-	return renderLyrics(source, { parts, layout: settings.layout, separator: settings.inlineSeparator, resolve });
+	const opts = { parts, layout: settings.layout, separator: settings.inlineSeparator, resolve };
+	const lines = new Map<string, string[]>();
+	for (const line of sources) lines.set(normalizeLine(line), renderParts(line, opts));
+
+	return { lyrics: renderLyrics(source, opts), lines };
 };
 
 /** Direction only flips when a line is purely target-language text. */
@@ -84,13 +96,50 @@ const directionFor = (source: LyricsSnapshot) => {
 	return isRightToLeft(settings.targetLanguage) ? RTL : LTR;
 };
 
+/** A translated line that isn't just its own source, to probe what the view is showing. */
+const sampleTranslated = ({ lines }: Render): string | null => {
+	for (const [source, parts] of lines) {
+		const last = parts[parts.length - 1];
+		if (last !== undefined && normalizeLine(last) !== source) return last;
+	}
+	return null;
+};
+
+/**
+ * Puts a render on screen. TIDAL's own cache is rewritten when the lyrics came from it,
+ * and the display overlay takes over whenever that doesn't reach the view — which is the
+ * case whenever another plugin is supplying the lyrics.
+ */
+const display = async (source: LyricsSnapshot, render: Render) => {
+	setOverlay(null);
+	const patched = patchLyrics(source, { ...render.lyrics, direction: directionFor(source) });
+
+	if (patched) {
+		// Give the view a moment to redraw from the patched data before deciding.
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		const sample = sampleTranslated(render);
+		if (sample === null || domShowsLine(sample)) return true;
+		trace.log("Data patch did not reach the view; using the display overlay instead");
+	}
+
+	setOverlay({
+		lines: render.lines,
+		layout: settings.layout,
+		separator: settings.inlineSeparator,
+		replaceSource: !partsFor(settings.displayMode).includes("original"),
+		key: renderKey(source.cacheKey),
+	});
+	return true;
+};
+
 const showTranslation = async () => {
 	if (current === null || busy) return;
 	const source = current;
 
 	const cached = renders.get(renderKey(source.cacheKey));
 	if (cached !== undefined) {
-		if (patchLyrics(source, { ...cached, direction: directionFor(source) })) showing = "translated";
+		await display(source, cached);
+		showing = "translated";
 		updateButtons();
 		return;
 	}
@@ -104,7 +153,8 @@ const showTranslation = async () => {
 
 		if (renders.size >= CACHE_LIMIT) renders.delete(renders.keys().next().value!);
 		renders.set(renderKey(source.cacheKey), result);
-		if (patchLyrics(source, { ...result, direction: directionFor(source) })) showing = "translated";
+		await display(source, result);
+		showing = "translated";
 	} catch (err) {
 		trace.msg.err.withContext("Failed to translate lyrics")(err);
 	} finally {
@@ -114,9 +164,8 @@ const showTranslation = async () => {
 };
 
 const showOriginal = () => {
-	if (current === null) return;
-	if (!patchLyrics(current, { text: current.text, lrcText: current.lrcText, direction: current.direction }))
-		trace.err("Could not restore the original lyrics: the cache entry is gone");
+	setOverlay(null);
+	if (current !== null) patchLyrics(current, { text: current.text, lrcText: current.lrcText, direction: current.direction });
 	showing = "original";
 	updateButtons();
 };
@@ -139,6 +188,7 @@ const toggle = () => {
 let currentTrackId: string | undefined;
 
 const adopt = (found: LyricsSnapshot | null) => {
+	setOverlay(null);
 	current = found;
 	showing = "original";
 	updateButtons();
@@ -147,21 +197,22 @@ const adopt = (found: LyricsSnapshot | null) => {
 
 const onStoreChange = () => {
 	const trackId = playingTrackId();
-	const found = findLyrics(trackId);
+	const found = findAnyLyrics(trackId);
 	// First sighting of a cache entry is the untouched version — everything later may be ours.
 	if (found !== null && !originals.has(found.cacheKey)) originals.set(found.cacheKey, found);
 
 	// A new track resets everything, including a translation left showing for the old one.
-	if (trackId !== currentTrackId) {
-		currentTrackId = trackId;
+	const trackChanged = trackId !== currentTrackId;
+	currentTrackId = trackId;
+
+	if (trackChanged) {
 		adopt(found === null ? null : originals.get(found.cacheKey)!);
 		return;
 	}
 
-	// Same track: pick lyrics up when they finally arrive, but never switch away from the
-	// entry we are already showing — the newest-fulfilled fallback would otherwise flip
-	// `current` onto another track's cache entry and desync the toggle.
-	if (current === null && found !== null) adopt(originals.get(found.cacheKey)!);
+	// Same track: adopt its lyrics once they arrive (they land a moment after the player
+	// switches, so a track change alone usually finds nothing).
+	if (found !== null && current?.cacheKey !== found.cacheKey) adopt(originals.get(found.cacheKey)!);
 };
 
 let pending: ReturnType<typeof setTimeout> | undefined;
@@ -177,6 +228,7 @@ const scheduleScan = () => {
 	}, 150);
 };
 
+initOverlay(unloads);
 unloads.add(reduxStore.subscribe(scheduleScan));
 unloads.add(() => {
 	if (pending !== undefined) clearTimeout(pending);

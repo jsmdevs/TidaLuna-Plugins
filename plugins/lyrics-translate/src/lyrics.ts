@@ -47,7 +47,7 @@ export interface RenderOptions {
 }
 
 /** The parts of a rendered line, with empty and consecutive-duplicate parts dropped. */
-const renderParts = (source: string, { parts, resolve }: RenderOptions): string[] => {
+export const renderParts = (source: string, { parts, resolve }: RenderOptions): string[] => {
 	const out: string[] = [];
 	for (const part of parts) {
 		const text = resolve(part, source).trim();

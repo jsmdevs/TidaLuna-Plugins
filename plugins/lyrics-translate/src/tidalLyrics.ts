@@ -11,10 +11,17 @@ import { PlayState } from "@luna/lib";
  */
 const API_SLICE = "tidalOpenPlatformApi";
 
+/**
+ * `cache` — TIDAL's own RTK Query entry, which we can rewrite.
+ * `entity` — the normalized lyrics entity another plugin injected; read-only for us, so
+ * lyrics from that origin are translated through the display overlay instead.
+ */
+export type LyricsOrigin = "cache" | "entity";
+
 export interface LyricsSnapshot {
+	origin: LyricsOrigin;
+	/** Cache entry key, or `entity:<id>`. Identifies the lyrics for caching renders. */
 	cacheKey: string;
-	/** Index of the lyrics resource inside `data.included`. */
-	index: number;
 	trackId?: string;
 	/** Unsynced lyrics. */
 	text: string;
@@ -37,8 +44,8 @@ const snapshot = (cacheKey: string, entry: CacheEntry): LyricsSnapshot | null =>
 
 	const attributes = included[index].attributes!;
 	return {
+		origin: "cache",
 		cacheKey,
-		index,
 		trackId: entry.originalArgs?.id,
 		text: String(attributes.text ?? ""),
 		lrcText: String(attributes.lrcText ?? ""),
@@ -54,21 +61,50 @@ export const playingTrackId = (): string | undefined => {
 };
 
 /**
- * Cached lyrics for the given track. Falls back to the most recently fulfilled lyrics
- * when that track has none of its own — the lyrics view can trail the player.
+ * Cached lyrics for the given track, and only for that track.
+ *
+ * There is deliberately no "most recent lyrics" fallback: a track change fetches the new
+ * lyrics a moment after the player switches, and falling back during that gap selects the
+ * previous song's cache entry — which then gets translated instead of the one on screen.
  */
 export const findLyrics = (trackId?: string): LyricsSnapshot | null => {
-	let newest: { snap: LyricsSnapshot; at: number } | null = null;
+	if (trackId === undefined) return null;
 	for (const [cacheKey, entry] of Object.entries(queries())) {
-		if (entry?.status !== "fulfilled") continue;
+		if (entry?.status !== "fulfilled" || String(entry.originalArgs?.id ?? "") !== trackId) continue;
 		const snap = snapshot(cacheKey, entry);
-		if (snap === null) continue;
-		if (trackId !== undefined && snap.trackId === trackId) return snap;
-		const at = entry.fulfilledTimeStamp ?? 0;
-		if (newest === null || at > newest.at) newest = { snap, at };
+		if (snap !== null) return snap;
 	}
-	return newest?.snap ?? null;
+	return null;
 };
+
+/**
+ * Lyrics for the given track as held in the normalized entity store.
+ *
+ * This is what the lyrics view actually renders, and it is where plugins that supply their
+ * own lyrics (Radiant Lyrics injects `radiant-lyrics-<trackId>`) put theirs. We can read it
+ * but not write it, so these are translated through the display overlay.
+ */
+export const findEntityLyrics = (trackId?: string): LyricsSnapshot | null => {
+	if (trackId === undefined) return null;
+	const entities: Record<string, any> = (reduxStore.getState() as any)?.entities?.lyrics?.entities ?? {};
+	for (const [id, entity] of Object.entries(entities)) {
+		if (!String(id).includes(trackId)) continue;
+		const attributes = entity?.attributes;
+		if (typeof attributes?.text !== "string" && typeof attributes?.lrcText !== "string") continue;
+		return {
+			origin: "entity",
+			cacheKey: `entity:${id}`,
+			trackId,
+			text: String(attributes.text ?? ""),
+			lrcText: String(attributes.lrcText ?? ""),
+			direction: typeof attributes.direction === "string" ? attributes.direction : undefined,
+		};
+	}
+	return null;
+};
+
+/** Whatever lyrics are in play for a track: the rendered ones first, TIDAL's own otherwise. */
+export const findAnyLyrics = (trackId?: string): LyricsSnapshot | null => findEntityLyrics(trackId) ?? findLyrics(trackId);
 
 /**
  * Rewrites a cached lyrics resource in place. Uses RTK Query's own patch action, so
@@ -78,6 +114,7 @@ export const findLyrics = (trackId?: string): LyricsSnapshot | null => {
  * on every refetch and the lyrics resource does not keep a fixed position in it.
  */
 export const patchLyrics = (target: LyricsSnapshot, values: { text?: string; lrcText?: string; direction?: string }): boolean => {
+	if (target.origin !== "cache") return false;
 	const included = queries()[target.cacheKey]?.data?.included;
 	const index = included?.findIndex((resource) => resource?.type === "lyrics") ?? -1;
 	if (index === -1) return false;
