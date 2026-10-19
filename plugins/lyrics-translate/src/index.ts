@@ -1,9 +1,9 @@
 import { reduxStore, Tracer, type LunaUnload } from "@luna/core";
 import { observe } from "@luna/lib";
 
-import { domShowsLine, initOverlay, normalizeLine, setOverlay } from "./domOverlay";
+import { domShowsLine, initOverlay, normalizeLine, refreshOverlay, setMissingHandler, setOverlay, setOverlayScale } from "./domOverlay";
 import { isRightToLeft, sameLanguage } from "./languages";
-import { collectSourceLines, renderLyrics, renderParts, type LyricsText } from "./lyrics";
+import { collectSourceLines, renderLyrics, renderParts, type LyricsText, type RenderOptions } from "./lyrics";
 import { partsFor, type LinePart } from "./modes";
 import { settings, Settings } from "./Settings";
 import { findAnyLyrics, patchLyrics, playingTrackId, type LyricsSnapshot } from "./tidalLyrics";
@@ -36,18 +36,21 @@ const renderKey = (cacheKey: string) => `${cacheKey}|${settingsKey()}`;
 let current: LyricsSnapshot | null = null;
 let showing: "original" | "translated" = "original";
 let busy = false;
+let retryAfterBusy = false;
 
 /** Called by the settings page: earlier renders no longer match the new settings. */
 export const clearCache = () => {
 	renders.clear();
+	requestedMissing.clear();
 	if (showing === "translated") showOriginal();
 	updateButtons();
 };
 
-const buildTranslation = async (source: LyricsSnapshot): Promise<Render | null> => {
-	const sources = collectSourceLines(source);
-	if (sources.length === 0) return null;
-
+/**
+ * Translates / romanizes the given lines and returns the options needed to render them.
+ * `allowAbort` stops the whole job when the lyrics turn out to be in the target language.
+ */
+const translateSources = async (sources: string[], allowAbort = true): Promise<{ opts: RenderOptions } | null> => {
 	const parts = partsFor(settings.displayMode);
 	const targetLang = settings.targetLanguage;
 
@@ -64,7 +67,7 @@ const buildTranslation = async (source: LyricsSnapshot): Promise<Render | null> 
 	if (parts.includes("translation")) {
 		const result = await translateLines(sources, {
 			targetLang,
-			abortOnSource: (src) => settings.skipSameLanguage && sameLanguage(src, targetLang),
+			abortOnSource: allowAbort ? (src) => settings.skipSameLanguage && sameLanguage(src, targetLang) : undefined,
 		});
 		detected ??= result.src;
 		if (result.aborted) {
@@ -82,11 +85,20 @@ const buildTranslation = async (source: LyricsSnapshot): Promise<Render | null> 
 		return line;
 	};
 
-	const opts = { parts, layout: settings.layout, separator: settings.inlineSeparator, resolve };
-	const lines = new Map<string, string[]>();
-	for (const line of sources) lines.set(normalizeLine(line), renderParts(line, opts));
+	return { opts: { parts, layout: settings.layout, separator: settings.inlineSeparator, resolve } };
+};
 
-	return { lyrics: renderLyrics(source, opts), lines };
+const buildTranslation = async (source: LyricsSnapshot): Promise<Render | null> => {
+	const sources = collectSourceLines(source);
+	if (sources.length === 0) return null;
+
+	const built = await translateSources(sources);
+	if (built === null) return null;
+
+	const lines = new Map<string, string[]>();
+	for (const line of sources) lines.set(normalizeLine(line), renderParts(line, built.opts));
+
+	return { lyrics: renderLyrics(source, built.opts), lines };
 };
 
 /** Direction only flips when a line is purely target-language text. */
@@ -133,7 +145,14 @@ const display = async (source: LyricsSnapshot, render: Render) => {
 };
 
 const showTranslation = async () => {
-	if (current === null || busy) return;
+	if (current === null) return;
+	// Another translation is in flight. Remember to run again for whatever is current once
+	// it ends, instead of silently dropping this request (the lyrics source can change a
+	// moment after a track change, e.g. when Radiant Lyrics injects its own entity).
+	if (busy) {
+		retryAfterBusy = true;
+		return;
+	}
 	const source = current;
 
 	const cached = renders.get(renderKey(source.cacheKey));
@@ -160,6 +179,10 @@ const showTranslation = async () => {
 	} finally {
 		busy = false;
 		updateButtons();
+		if (retryAfterBusy) {
+			retryAfterBusy = false;
+			if (current !== null && current.cacheKey !== source.cacheKey) void showTranslation();
+		}
 	}
 };
 
@@ -168,6 +191,36 @@ const showOriginal = () => {
 	if (current !== null) patchLyrics(current, { text: current.text, lrcText: current.lrcText, direction: current.direction });
 	showing = "original";
 	updateButtons();
+};
+
+// Lines on screen that the translated lyrics have no entry for. This happens when another
+// plugin supplies lyrics worded differently from the ones that were translated, so they are
+// translated straight from what the view shows. Each is requested once per track and settings.
+const requestedMissing = new Set<string>();
+
+const translateMissing = async (texts: string[], overlayKey: string) => {
+	if (current === null || showing !== "translated") return;
+	const key = renderKey(current.cacheKey);
+	const render = renders.get(key);
+	if (render === undefined || key !== overlayKey) return;
+
+	const fresh = texts.filter((text) => {
+		const id = `${key}\0${text}`;
+		if (requestedMissing.has(id)) return false;
+		requestedMissing.add(id);
+		return true;
+	});
+	if (fresh.length === 0) return;
+
+	try {
+		const built = await translateSources(fresh, false);
+		// The track or the display changed while translating — drop the stale result.
+		if (built === null || showing !== "translated" || current === null || renderKey(current.cacheKey) !== key) return;
+		for (const line of fresh) render.lines.set(normalizeLine(line), renderParts(line, built.opts));
+		refreshOverlay();
+	} catch (err) {
+		trace.err.withContext("Failed to translate lines the view shows")(err);
+	}
 };
 
 const toggle = () => {
@@ -188,11 +241,15 @@ const toggle = () => {
 let currentTrackId: string | undefined;
 
 const adopt = (found: LyricsSnapshot | null) => {
+	// Same track, different lyrics source (TIDAL's cache -> Radiant Lyrics' entity): if a
+	// translation was showing, keep wanting one rather than resetting to the original.
+	const keep = showing === "translated" && found !== null && found.trackId !== undefined && found.trackId === current?.trackId;
 	setOverlay(null);
+	requestedMissing.clear();
 	current = found;
 	showing = "original";
 	updateButtons();
-	if (found !== null && settings.autoTranslate) void showTranslation();
+	if (found !== null && (settings.autoTranslate || keep)) void showTranslation();
 };
 
 const onStoreChange = () => {
@@ -229,6 +286,8 @@ const scheduleScan = () => {
 };
 
 initOverlay(unloads);
+setOverlayScale(settings.translationScale ?? 100);
+setMissingHandler(translateMissing);
 unloads.add(reduxStore.subscribe(scheduleScan));
 unloads.add(() => {
 	if (pending !== undefined) clearTimeout(pending);

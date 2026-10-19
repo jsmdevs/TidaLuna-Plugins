@@ -1,8 +1,9 @@
 import { ReactiveStore } from "@luna/core";
-import { LunaSelectItem, LunaSelectSetting, LunaSettings, LunaSwitchSetting, LunaTextSetting } from "@luna/ui";
+import { LunaNumberSetting, LunaSelectItem, LunaSelectSetting, LunaSettings, LunaSwitchSetting, LunaTextSetting } from "@luna/ui";
 import React from "react";
 
 import { clearCache } from ".";
+import { setOverlayScale } from "./domOverlay";
 import { defaultTargetLanguage, languages } from "./languages";
 import { displayModes, layouts, type DisplayMode, type Layout } from "./modes";
 
@@ -16,6 +17,8 @@ export const settings = await ReactiveStore.getPluginStorage("TidalLyricsTransla
 	// Leave lyrics alone when they're already in the target language.
 	skipSameLanguage: true,
 	showButton: true,
+	// Size of the translated text, in percent of its default (100 = default).
+	translationScale: 100,
 });
 
 // The MUI prop types don't survive Luna's React.memo wrappers, so handler params are annotated here.
@@ -35,6 +38,7 @@ export const Settings = () => {
 	const [autoTranslate, setAutoTranslate] = React.useState(settings.autoTranslate);
 	const [skipSameLanguage, setSkipSameLanguage] = React.useState(settings.skipSameLanguage);
 	const [showButton, setShowButton] = React.useState(settings.showButton);
+	const [translationScale, setTranslationScale] = React.useState(settings.translationScale ?? 100);
 
 	// Anything that changes how a line is rendered invalidates what's cached and on screen.
 	const multiPart = displayMode.includes("+");
@@ -103,6 +107,17 @@ export const Settings = () => {
 					}}
 				/>
 			)}
+			<LunaNumberSetting
+				title="Translation size (%)"
+				desc="Size of the translated or romanized text relative to its default. 100 is the default; try 130 for larger text"
+				min={50}
+				max={300}
+				value={translationScale}
+				onNumber={(value: number) => {
+					setTranslationScale((settings.translationScale = value));
+					setOverlayScale(value);
+				}}
+			/>
 			<LunaSwitchSetting
 				title="Translate automatically"
 				desc="Translate every track as its lyrics load, without pressing the button"
